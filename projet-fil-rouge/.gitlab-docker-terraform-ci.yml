@@ -1,0 +1,264 @@
+variables:
+  IMAGE_NAME: ic-webapp
+  CONTAINER_PORT: "8080"
+  IMAGE_TAG: "1.0"
+  HOST_PORT: "8080"
+  TEST_CONTAINER: test-ic-webapp
+  CI_REGISTRY_IMAGE: ${WORKPACE}/${IMAGE_NAME}:${IMAGE_TAG}
+  TF_DIR: ${CI_PROJECT_DIR}/sources/terraform
+
+image: docker:latest
+services:
+  - name: docker:dind
+    alias: docker
+
+stages:
+  - Build image
+  - Test acceptation
+  - Release image
+  - Provision Staging
+  - Destroy staging
+  - Code review
+  - Stop review
+  - Deploy staging
+  - Test staging
+  - Provision prod 
+  - Destroy prod
+  - Deploy prod
+  - Test prod
+
+
+.get_private_key: &get_private_key
+  - touch ./sources/.env
+  - echo "Generating env-file"
+  - echo USER=$ODOO_USER >> ./sources/.env
+  - echo ODOO_DB=$ODOO_DB >> ./sources/.env
+  - echo PASSWORD=$ODOO_PASSWORD >> ./sources/.env
+  - echo POSTGRES_DB=$POSTGRES_DB >> ./sources/.env
+  - echo POSTGRES_PASSWORD=$POSTGRES_PASSWORD >> ./sources/.env
+  - echo POSTGRES_USER=$POSTGRES_USER >> ./sources/.env
+  - echo PGDATA=$PGDATA >> ./sources/.env
+  - echo PGADMIN_DEFAULT_EMAIL=$PGADMIN_DEFAULT_EMAIL >> ./sources/.env
+  - echo PGADMIN_DEFAULT_PASSWORD=$PGADMIN_DEFAULT_PASSWORD >> ./sources/.env
+  - echo PGADMIN_LISTEN_PORT=$PGADMIN_LISTEN_PORT >> ./sources/.env 
+  - export instance_ip=$(awk '{print $1}' $TF_DIR/$ENV_NAME/files/infos_ec2.txt)
+  - cat $TF_VAR_SSH_PRIVATE_KEY > $TF_DIR/files/$TF_VAR_AWS_KEY_NAME.pem
+  - chmod 400 $TF_DIR/files/$TF_VAR_AWS_KEY_NAME.pem
+    
+.test_template: &test_apps
+  before_script:
+    - *get_private_key
+  script:
+    - scp -i $TF_DIR/files/$TF_VAR_AWS_KEY_NAME.pem -o StrictHostKeyChecking=no  ./sources/test-app.sh  $EC2_USER@$instance_ip:/home/$EC2_USER/
+    - ssh -i $TF_DIR/files/$TF_VAR_AWS_KEY_NAME.pem -o StrictHostKeyChecking=no  $EC2_USER@$instance_ip "chmod +x test-app.sh && sh test-app.sh"
+
+
+build-image:
+  stage: Build image
+  script:
+    - docker build --no-cache -f ./sources/Dockerfile -t ${IMAGE_NAME}:${IMAGE_TAG} ./sources/
+    - docker images
+    - docker save ${IMAGE_NAME}:${IMAGE_TAG} > ${IMAGE_NAME}.tar
+  artifacts:
+    when: on_success
+    paths:
+      - ${IMAGE_NAME}.tar
+
+test-acceptation:
+  stage: Test acceptation
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - docker load -i ${IMAGE_NAME}.tar
+    - docker stop ${TEST_CONTAINER} || true && docker rm ${TEST_CONTAINER} || true
+    - docker run --name ${TEST_CONTAINER} -d -p ${HOST_PORT}:${CONTAINER_PORT} -e PORT=${CONTAINER_PORT} ${IMAGE_NAME}:${IMAGE_TAG}
+    - sleep 5
+    - docker logs ${TEST_CONTAINER}
+    - curl http://docker:${HOST_PORT}|grep -i "Odoo"
+
+release-image:
+  stage: Release image
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - echo ${DOCKER_HUB_TOKEN} | docker login -u ${DOCKER_USER} --password-stdin ${DOCKER_REGISTRY}
+  script:
+    - docker load -i ${IMAGE_NAME}.tar
+    - docker tag "$IMAGE_NAME:$IMAGE_TAG" "$CI_REGISTRY/$REGISTRY_IMAGE:$CI_COMMIT_REF_NAME"
+    - docker tag "$IMAGE_NAME:$IMAGE_TAG" "$CI_REGISTRY/$REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - docker push "$CI_REGISTRY/$REGISTRY_IMAGE:$CI_COMMIT_REF_NAME"
+    - docker push "$CI_REGISTRY/$REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - sleep 5
+    - docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${CI_REGISTRY_IMAGE} #dockerhub
+    - docker push ${CI_REGISTRY_IMAGE} 
+
+.common:
+  image: 
+    name: hashicorp/terraform:light
+    entrypoint: [""]
+  before_script:
+    - mkdir -p ~/.aws
+    - echo "[default]" > ~/.aws/credentials
+    - echo -e "aws_access_key_id=$AWS_ACCESS_KEY_ID" >> ~/.aws/credentials
+    - echo -e "aws_secret_access_key=$AWS_SECRET_ACCESS_KEY" >> ~/.aws/credentials
+    - echo -e "aws_profile=$AWS_PROFILE" >> ~/.aws/credentials
+    - chmod 400 ~/.aws/credentials
+    - cat ~/.aws/credentials
+    - echo "Generating aws private key"
+    - *get_private_key
+    - cd $TF_DIR/$ENV_NAME
+    - terraform init -input=false
+  artifacts:
+    untracked: false
+    when: on_success
+    expire_in: "30 days"
+    paths:
+      - "$TF_DIR/$ENV_NAME/.terraform"
+
+
+staging-server:
+  variables:
+    ENV_NAME: staging
+  extends: .common
+  stage: Provision Staging
+  # only:
+  #   - features
+  script: 
+    - terraform plan -out "$ENV_NAME.plan"
+    - terraform apply "$ENV_NAME.plan"
+  artifacts:
+    untracked: false
+    when: on_success
+    expire_in: "30 days"
+    paths:
+      - "$TF_DIR/$ENV_NAME/files/infos_ec2.txt"
+
+
+.env-file: 
+  before_script:
+    - touch ./sources/.env
+    - echo "Generating env-file"
+    - echo USER=$ODOO_USER >> ./sources/.env
+    - echo ODOO_DB=$ODOO_DB >> ./sources/.env
+    - echo PASSWORD=$ODOO_PASSWORD >> ./sources/.env
+    - echo POSTGRES_DB=$POSTGRES_DB >> ./sources/.env
+    - echo POSTGRES_PASSWORD=$POSTGRES_PASSWORD >> ./sources/.env
+    - echo POSTGRES_USER=$POSTGRES_USER >> ./sources/.env
+    - echo PGDATA=$PGDATA >> ./sources/.env
+    - echo PGADMIN_DEFAULT_EMAIL=$PGADMIN_DEFAULT_EMAIL >> ./sources/.env
+    - echo PGADMIN_DEFAULT_PASSWORD=$PGADMIN_DEFAULT_PASSWORD >> ./sources/.env
+    - echo PGADMIN_LISTEN_PORT=$PGADMIN_LISTEN_PORT >> ./sources/.env
+    - *get_private_key
+    
+    
+.deploy: &deploy
+  script:
+    - export instance_ip=$(awk '{print $1}' $TF_DIR/$ENV_NAME/files/infos_ec2.txt)
+    - ssh -i $TF_DIR/files/$TF_VAR_AWS_KEY_NAME.pem -o StrictHostKeyChecking=no  $EC2_USER@$instance_ip "mkdir -p data"
+    - scp -i $TF_DIR/files/$TF_VAR_AWS_KEY_NAME.pem -o StrictHostKeyChecking=no -r ./sources/Dockerfile ./sources/app/ ./sources/.env ./sources/releases.txt $TF_DIR/$ENV_NAME/files/infos_ec2.txt ./sources/docker-compose.yml ./sources/get_instance_ip.sh  $EC2_USER@$instance_ip:/home/$EC2_USER/data 
+    - ssh -i $TF_DIR/files/$TF_VAR_AWS_KEY_NAME.pem -o StrictHostKeyChecking=no  $EC2_USER@$instance_ip "chmod +x data/get_instance_ip.sh && sh data/get_instance_ip.sh"
+
+
+# deploy-review:
+#   stage: Code review
+#   environment:
+#     name: review/$CI_COMMIT_REF_NAME
+#     url: http://${instance_ip}:8080
+#     on_stop: stop-review
+#   only:
+#     - merge_requests
+#   before_script:
+#     - *get_private_key
+#   variables:
+#     ENV_NAME: staging
+#   <<: *deploy
+  
+
+# stop-review:
+#   stage: Stop review
+#   variables:
+#     GIT_STRATEGY: none
+#     APP_NAME: ${REVIEW_APP_NAME}
+#     ENV_NAME: staging
+#   environment:
+#     name: review/$CI_COMMIT_REF_NAME
+#     action: stop
+#   only:
+#     - merge_requests
+#   when: manual  
+#   script:
+#     - apk --no-cache add curl
+#     - echo "review is deleted"
+
+staging-destroy:
+  variables:
+    ENV_NAME: staging
+  extends: .common
+  stage: Destroy staging
+  when: manual
+  script: 
+    - cd $TF_DIR/$ENV_NAME
+    - terraform destroy --auto-approve -input=false
+
+
+staging-deployment:
+  variables:
+    ENV_NAME: staging
+  extends: .env-file
+  stage: Deploy staging
+  # only:
+  #   - features
+  <<: *deploy
+
+staging-test:
+  variables:
+    ENV_NAME: staging
+  stage: Test staging
+  # only:
+  #   - features
+  <<: *test_apps
+
+prod-server:
+  variables:
+    ENV_NAME: prod
+  extends: .common
+  stage: Provision prod
+  only:
+   - main
+  script: 
+    - terraform plan -out "$ENV_NAME.plan"
+    - terraform apply "$ENV_NAME.plan"
+  artifacts:
+    untracked: false
+    when: on_success
+    expire_in: "30 days"
+    paths:
+      - "$TF_DIR/$ENV_NAME/files/infos_ec2.txt"
+
+prod-destroy:
+  variables:
+    ENV_NAME: prod
+  extends: .common
+  stage: Destroy prod
+  only:
+   - main
+  when: manual
+  script: 
+    - cd $TF_DIR/$ENV_NAME
+    - terraform destroy --auto-approve -input=false
+
+prod-deployment:
+  variables:
+    ENV_NAME: prod
+  extends: .env-file
+  stage: Deploy prod
+  only:
+   - main
+  <<: *deploy
+
+prod-test:
+  variables:
+    ENV_NAME: prod
+  stage: Test prod
+  only:
+   - main
+  <<: *test_apps

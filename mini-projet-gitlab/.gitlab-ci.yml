@@ -1,0 +1,153 @@
+variables:
+  APP_NAME: website
+  PROD_NAME: prod-${APP_NAME}
+  STG_NAME: staging-${APP_NAME}
+  REVIEW_APP_NAME: website-${CI_COMMIT_REF_NAME}
+  REVIEW_APP_ENDPOINT: ${REVIEW_IP}:${REVIEW_EXTERNAL_PORT}
+  STG_APP_ENDPOINT: ${STAGING_IP}:${STG_EXTERNAL_PORT}
+  PROD_APP_ENDPOINT: ${PROD_IP}:${PROD_EXTERNAL_PORT}
+  INTERNAL_PORT: 80
+  EXTERNAL_PORT: 80
+  STG_EXTERNAL_PORT: 5000
+  PROD_EXTERNAL_PORT: 5001
+  REVIEW_EXTERNAL_PORT: 5002
+  CONTAINER_IMAGE: ${IMAGE_NAME}:${CI_COMMIT_REF_NAME}
+
+
+image: docker:latest
+services:
+  - name: docker:dind
+    alias: docker
+
+stages:
+  - Build image
+  - Test acceptation
+  - Release image
+  - Deploy review
+  - Stop review
+  - Deploy staging
+  - Test staging  
+  - Deploy prod
+  - Test prod
+
+.test_template: &test
+  image: alpine
+  script:
+    - apk --no-cache add curl
+    - curl -k "http://$DOMAIN" | grep -i "DIMENSION"
+
+.ssh_template: &ssh
+  before_script:
+    - command -v ssh-agent > /dev/null || (apk add --update openssh)
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY"|tr -d '\r'| ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+    - apk add --no-cache curl
+
+build-image:
+  stage: Build image
+  script:
+    - docker build -t website-static .
+    - docker save website-static > website-static.tar
+  artifacts:
+    paths:
+      - website-static.tar
+
+test-acceptation:
+  stage: Test acceptation
+  script:
+    - docker load -i website-static.tar
+    - docker stop website-static || true && docker rm website-static || true
+    - docker run --name site -d -p $EXTERNAL_PORT:$INTERNAL_PORT website-static
+    - apk add --no-cache curl
+    - sleep 5
+    - curl http://docker
+
+release-image:
+  stage: Release image
+  script:
+    - docker load -i website-static.tar
+    - docker tag website-static "${IMAGE_NAME}:${CI_COMMIT_REF_NAME}"
+    - docker tag website-static "${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"
+    - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+    - docker push "${IMAGE_NAME}:${CI_COMMIT_REF_NAME}"
+    - docker push "${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"
+
+deploy review:
+  stage: Deploy review
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    url: http://${REVIEW_APP_ENDPOINT}
+    on_stop: stop review
+  only:
+    - merge_requests
+  variables:
+    APP_NAME: ${REVIEW_APP_NAME}
+  <<: *ssh
+  script:
+    - sleep 5
+    - ssh -T -p ${PORT} -l ${DEPLOY_USER} ${STAGING_IP} "docker run --name ${APP_NAME} -d -p $REVIEW_EXTERNAL_PORT:$INTERNAL_PORT "${IMAGE_NAME}:${CI_COMMIT_REF_NAME}""
+    - - 'curl "http://${REVIEW_APP_ENDPOINT}"'
+
+
+stop review:
+  stage: Stop review
+  variables:
+    GIT_STRATEGY: none
+    APP_NAME: ${REVIEW_APP_NAME}
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    action: stop
+  only:
+    - merge_requests
+  when: manual  
+  script:
+    - apk --no-cache add curl
+    - echo "delete"
+
+staging-deploy:
+  stage: Deploy staging
+  only:
+    - features
+  environment:
+    name: staging
+    url: http://$STG_APP_ENDPOINT
+  <<: *ssh
+  script:
+    - sleep 5
+    - echo "deploying to staging"
+    - ssh -T -p ${PORT} -l ${DEPLOY_USER} ${STAGING_IP} "docker pull "${IMAGE_NAME}:${CI_COMMIT_REF_NAME}";docker stop ${APP_NAME} || true && docker rm ${APP_NAME} || true;docker run --name ${APP_NAME} -d -p ${STG_EXTERNAL_PORT}:${INTERNAL_PORT} "${IMAGE_NAME}:${CI_COMMIT_REF_NAME}";docker rmi -f ${APP_NAME}"
+    
+    
+prod-deploy:
+  stage: Deploy prod
+  only:
+    - main
+  environment:
+    name: prod
+    url: http://$PROD_APP_ENDPOINT
+    
+  <<: *ssh
+  script:
+    - sleep 5
+    - ssh -T -p ${PORT} -l ${DEPLOY_USER} ${PROD_IP} "docker stop ${PROD_NAME} || true && docker rm ${PROD_NAME} || true; docker run --name ${PROD_NAME} -d -p ${PROD_EXTERNAL_PORT}:${INTERNAL_PORT} "${IMAGE_NAME}:${CI_COMMIT_REF_NAME}""
+
+
+staging-test:
+  <<: *test
+  stage: Test staging
+  only:
+  - features
+  variables:
+    DOMAIN: ${STG_APP_ENDPOINT}
+
+
+prod-test:
+  <<: *test
+  stage: Test prod
+  only:
+    - main 
+  variables:
+    DOMAIN: ${PROD_APP_ENDPOINT}

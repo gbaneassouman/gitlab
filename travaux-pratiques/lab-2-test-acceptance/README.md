@@ -49,6 +49,7 @@ test-acceptation:
 - `docker load -i alpinehelloworld.tar` : Permet de charger l'image buildée dans le précédent stage
 - `CONTAINER_IP`: Récupère l'adresse ip du conteneur et l'exporte en variable d'environnement
 
+---
 ![](../images/acceptance.png)
-
+---
 ![](../images/acceptance2.png)
